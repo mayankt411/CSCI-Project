@@ -1,0 +1,255 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <webots/robot.h>
+#include <webots/motor.h>
+#include <webots/distance_sensor.h>
+#include <webots/gps.h>
+#include <webots/light_sensor.h>
+#include <webots/led.h>
+
+#define PROXIMITY_SENSOR_COUNT 8
+#define LUMINOSITY_SENSOR_COUNT 8
+#define INDICATOR_LIGHT_COUNT 10
+
+// Configuration Parameters
+struct RobotConfig {
+    double max_velocity;
+    double standard_velocity;
+    double obstacle_proximity_threshold;
+    double frontal_obstacle_threshold;
+    double rotation_speed;
+    double origin_proximity_limit;
+    double luminosity_detection_threshold;
+    int minimum_exploration_time;
+};
+
+// Robot Navigation States
+enum NavigationState {
+    INIT_COORDINATES,
+    EXPLORE_BOUNDARY,
+    TRACK_LUMINOSITY,
+    MISSION_COMPLETE
+};
+
+// Robot Control Structure
+struct RobotController {
+    WbDeviceTag proximity_sensors[PROXIMITY_SENSOR_COUNT];
+    WbDeviceTag luminosity_sensors[LUMINOSITY_SENSOR_COUNT];
+    WbDeviceTag left_motor;
+    WbDeviceTag right_motor;
+    WbDeviceTag gps;
+    WbDeviceTag indicator_lights[INDICATOR_LIGHT_COUNT];
+    
+    struct RobotConfig config;
+    enum NavigationState current_state;
+    
+    double initial_position[3];
+    double peak_luminosity_position[3];
+    double peak_luminosity_value;
+    
+    int exploration_progress;
+    int coordinate_init_attempts;
+};
+
+// Function Prototypes
+void initialize_robot_systems(struct RobotController *robot);
+void reset_indicator_lights(struct RobotController *robot, int state);
+int validate_gps_data(WbDeviceTag gps);
+void update_luminosity_tracking(struct RobotController *robot);
+int check_proximity_to_origin(struct RobotController *robot);
+void compute_navigation_velocity(struct RobotController *robot, double *left_vel, double *right_vel, double *proximity_readings);
+
+void initialize_robot_systems(struct RobotController *robot) {
+    wb_robot_init();
+    int time_step = wb_robot_get_basic_time_step();
+
+    // Initialize proximity sensors
+    for (int i = 0; i < PROXIMITY_SENSOR_COUNT; i++) {
+        char sensor_name[5];
+        snprintf(sensor_name, sizeof(sensor_name), "ps%d", i);
+        robot->proximity_sensors[i] = wb_robot_get_device(sensor_name);
+        wb_distance_sensor_enable(robot->proximity_sensors[i], time_step);
+    }
+
+    // Initialize luminosity sensors
+    for (int i = 0; i < LUMINOSITY_SENSOR_COUNT; i++) {
+        char sensor_name[5];
+        snprintf(sensor_name, sizeof(sensor_name), "ls%d", i);
+        robot->luminosity_sensors[i] = wb_robot_get_device(sensor_name);
+        wb_light_sensor_enable(robot->luminosity_sensors[i], time_step);
+    }
+
+    // Motor initialization
+    robot->left_motor = wb_robot_get_device("left wheel motor");
+    robot->right_motor = wb_robot_get_device("right wheel motor");
+    wb_motor_set_position(robot->left_motor, INFINITY);
+    wb_motor_set_position(robot->right_motor, INFINITY);
+
+    // GPS and indicator lights
+    robot->gps = wb_robot_get_device("gps");
+    wb_gps_enable(robot->gps, time_step);
+
+    for (int i = 0; i < INDICATOR_LIGHT_COUNT; i++) {
+        char light_name[6];
+        snprintf(light_name, sizeof(light_name), "led%d", i);
+        robot->indicator_lights[i] = wb_robot_get_device(light_name);
+    }
+
+    // Initial state setup
+    robot->current_state = INIT_COORDINATES;
+    robot->exploration_progress = 0;
+    robot->coordinate_init_attempts = 0;
+    robot->peak_luminosity_value = -INFINITY;
+}
+
+void reset_indicator_lights(struct RobotController *robot, int state) {
+    for (int i = 0; i < INDICATOR_LIGHT_COUNT; i++) {
+        wb_led_set(robot->indicator_lights[i], state);
+    }
+}
+
+int validate_gps_data(WbDeviceTag gps) {
+    const double *coords = wb_gps_get_values(gps);
+    return (coords[0] == coords[0]) && (coords[1] == coords[1]) && 
+           (coords[0] != 0.0) && (coords[1] != 0.0);
+}
+
+void update_luminosity_tracking(struct RobotController *robot) {
+    double total_luminosity = 0;
+    for (int i = 0; i < LUMINOSITY_SENSOR_COUNT; i++) {
+        total_luminosity += wb_light_sensor_get_value(robot->luminosity_sensors[i]);
+    }
+    total_luminosity /= LUMINOSITY_SENSOR_COUNT;
+
+    const double *current_coords = wb_gps_get_values(robot->gps);
+
+    if (total_luminosity > robot->peak_luminosity_value) {
+        robot->peak_luminosity_value = total_luminosity;
+        memcpy(robot->peak_luminosity_position, current_coords, 3 * sizeof(double));
+        printf("Brightest light has been detected.The value is: %.2f at (%.2f, %.2f)\n", 
+               robot->peak_luminosity_value, 
+               robot->peak_luminosity_position[0], 
+               robot->peak_luminosity_position[1]);
+    }
+}
+
+int check_proximity_to_origin(struct RobotController *robot) {
+    const double *current_pos = wb_gps_get_values(robot->gps);
+    double dx = current_pos[0] - robot->initial_position[0];
+    double dy = current_pos[1] - robot->initial_position[1];
+    return sqrt(dx*dx + dy*dy) < robot->config.origin_proximity_limit;
+}
+
+void compute_navigation_velocity(struct RobotController *robot, double *left_vel, double *right_vel, double *proximity_readings) {
+    double front_left = proximity_readings[7];
+    double front = proximity_readings[0];
+    double front_right = proximity_readings[1];
+    double right_side = proximity_readings[2];
+
+    if (front > robot->config.frontal_obstacle_threshold || 
+        front_left > robot->config.frontal_obstacle_threshold || 
+        front_right > robot->config.frontal_obstacle_threshold) {
+        *left_vel = -robot->config.rotation_speed;
+        *right_vel = robot->config.rotation_speed;
+        return;
+    }
+
+    double correction = robot->config.obstacle_proximity_threshold - right_side;
+    
+    if (correction > 50) {
+        *left_vel = robot->config.standard_velocity;
+        *right_vel = robot->config.standard_velocity * 0.5;
+    } else if (correction < -50) {
+        *left_vel = robot->config.standard_velocity * 0.5;
+        *right_vel = robot->config.standard_velocity;
+    } else {
+        *left_vel = robot->config.standard_velocity;
+        *right_vel = robot->config.standard_velocity;
+    }
+}
+
+int main() {
+    struct RobotController robot = {
+        .config = {
+            .max_velocity = 6.28,
+            .standard_velocity = 3.0,
+            .obstacle_proximity_threshold = 150,
+            .frontal_obstacle_threshold = 150,
+            .rotation_speed = 2.0,
+            .origin_proximity_limit = 0.5,
+            .luminosity_detection_threshold = 0.15,
+            .minimum_exploration_time = 5000
+        }
+    };
+
+    initialize_robot_systems(&robot);
+    int time_step = wb_robot_get_basic_time_step();
+    reset_indicator_lights(&robot, 0);
+
+    printf("Robot exploration system initialized. Beginning navigation...\n");
+
+    while (wb_robot_step(time_step) != -1) {
+        double left_velocity = 0, right_velocity = 0;
+        double proximity_readings[PROXIMITY_SENSOR_COUNT];
+        
+        for (int i = 0; i < PROXIMITY_SENSOR_COUNT; i++) {
+            proximity_readings[i] = wb_distance_sensor_get_value(robot.proximity_sensors[i]);
+        }
+
+        switch (robot.current_state) {
+            case INIT_COORDINATES:
+                if (validate_gps_data(robot.gps)) {
+                    const double *initial_coords = wb_gps_get_values(robot.gps);
+                    memcpy(robot.initial_position, initial_coords, 3 * sizeof(double));
+                    robot.current_state = EXPLORE_BOUNDARY;
+                    printf("Navigation calibrated. Initial coordinates: (%.2f, %.2f)\n", 
+                           robot.initial_position[0], robot.initial_position[1]);
+                } else {
+                    robot.coordinate_init_attempts++;
+                    left_velocity = robot.config.standard_velocity;
+                    right_velocity = robot.config.standard_velocity;
+                }
+                break;
+
+            case EXPLORE_BOUNDARY:
+                update_luminosity_tracking(&robot);
+                compute_navigation_velocity(&robot, &left_velocity, &right_velocity, proximity_readings);
+                robot.exploration_progress++;
+                
+                if (check_proximity_to_origin(&robot) && robot.exploration_progress >= robot.config.minimum_exploration_time) {
+                    robot.current_state = TRACK_LUMINOSITY;
+                    robot.exploration_progress = 0;
+                    printf("Initial exploration complete. Starting luminosity tracking...\n");
+                }
+                break;
+
+            case TRACK_LUMINOSITY:
+                update_luminosity_tracking(&robot);
+                compute_navigation_velocity(&robot, &left_velocity, &right_velocity, proximity_readings);
+                
+                const double *current_pos = wb_gps_get_values(robot.gps);
+                double dx = current_pos[0] - robot.peak_luminosity_position[0];
+                double dy = current_pos[1] - robot.peak_luminosity_position[1];
+                
+                if (sqrt(dx*dx + dy*dy) < robot.config.luminosity_detection_threshold) {
+                    printf("Task accomplished!!! Peak light intensity has been found at (%.2f, %.2f)\n", 
+                           robot.peak_luminosity_position[0], robot.peak_luminosity_position[1]);
+                    reset_indicator_lights(&robot, 1);
+                    robot.current_state = MISSION_COMPLETE;
+                }
+                break;
+
+            case MISSION_COMPLETE:
+                left_velocity = 0;
+                right_velocity = 0;
+                break;
+        }
+
+        wb_motor_set_velocity(robot.left_motor, left_velocity);
+        wb_motor_set_velocity(robot.right_motor, right_velocity);
+    }
+
+    return 0;
+}
